@@ -1,0 +1,34 @@
+replicaCount: 1
+
+image:
+  repository: elastic-pvc
+  tag: latest
+  pullPolicy: IfNotPresent
+
+controller:
+  interval: 60s
+  logLevel: info  # info or debug
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 200m
+    memory: 128Mi
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+# Example StorageClass for Spark local storage.
+# Set enabled: true to create it.
+storageClass:
+  enabled: false
+  name: spark-local-ebs
+  parameters:
+    type: gp3
+    iops: "3000"
+    throughput: "125"
+    encrypted: "true"
