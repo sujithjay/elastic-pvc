@@ -16,5 +16,7 @@ type VolumeStats struct {
 type MetricsClient interface {
 	// GetMetrics returns volume stats keyed by PVC namespace/name.
 	// Only PVCs currently mounted by a pod will have stats.
-	GetMetrics(ctx context.Context) (map[types.NamespacedName]*VolumeStats, error)
+	// If nodeNames is non-empty, only those nodes are queried.
+	// If nodeNames is empty or nil, all nodes are queried.
+	GetMetrics(ctx context.Context, nodeNames []string) (map[types.NamespacedName]*VolumeStats, error)
 }

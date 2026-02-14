@@ -130,7 +130,7 @@ type fakeMetricsClient struct {
 	stats map[types.NamespacedName]*kubelet.VolumeStats
 }
 
-func (f *fakeMetricsClient) GetMetrics(_ context.Context) (map[types.NamespacedName]*kubelet.VolumeStats, error) {
+func (f *fakeMetricsClient) GetMetrics(_ context.Context, _ []string) (map[types.NamespacedName]*kubelet.VolumeStats, error) {
 	return f.stats, nil
 }
 
@@ -212,6 +212,119 @@ func TestResizeDecision(t *testing.T) {
 				t.Errorf("newSize = %d (%s), want %d (%s)",
 					newSize, resource.NewQuantity(newSize, resource.BinarySI).String(),
 					tt.expectedSize, resource.NewQuantity(tt.expectedSize, resource.BinarySI).String())
+			}
+		})
+	}
+}
+
+func TestPodMountsPVC(t *testing.T) {
+	tests := []struct {
+		name    string
+		pod     *corev1.Pod
+		pvcName string
+		want    bool
+	}{
+		{
+			"pod mounts the PVC",
+			&corev1.Pod{
+				Spec: corev1.PodSpec{
+					Volumes: []corev1.Volume{
+						{
+							Name: "data",
+							VolumeSource: corev1.VolumeSource{
+								PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+									ClaimName: "my-pvc",
+								},
+							},
+						},
+					},
+				},
+			},
+			"my-pvc",
+			true,
+		},
+		{
+			"pod mounts different PVC",
+			&corev1.Pod{
+				Spec: corev1.PodSpec{
+					Volumes: []corev1.Volume{
+						{
+							Name: "data",
+							VolumeSource: corev1.VolumeSource{
+								PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+									ClaimName: "other-pvc",
+								},
+							},
+						},
+					},
+				},
+			},
+			"my-pvc",
+			false,
+		},
+		{
+			"pod has no PVC volumes",
+			&corev1.Pod{
+				Spec: corev1.PodSpec{
+					Volumes: []corev1.Volume{
+						{
+							Name: "config",
+							VolumeSource: corev1.VolumeSource{
+								ConfigMap: &corev1.ConfigMapVolumeSource{
+									LocalObjectReference: corev1.LocalObjectReference{Name: "my-config"},
+								},
+							},
+						},
+					},
+				},
+			},
+			"my-pvc",
+			false,
+		},
+		{
+			"pod has no volumes",
+			&corev1.Pod{
+				Spec: corev1.PodSpec{
+					Volumes: []corev1.Volume{},
+				},
+			},
+			"my-pvc",
+			false,
+		},
+		{
+			"pod mounts multiple volumes including target PVC",
+			&corev1.Pod{
+				Spec: corev1.PodSpec{
+					Volumes: []corev1.Volume{
+						{
+							Name: "config",
+							VolumeSource: corev1.VolumeSource{
+								ConfigMap: &corev1.ConfigMapVolumeSource{
+									LocalObjectReference: corev1.LocalObjectReference{Name: "my-config"},
+								},
+							},
+						},
+						{
+							Name: "data",
+							VolumeSource: corev1.VolumeSource{
+								PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+									ClaimName: "my-pvc",
+								},
+							},
+						},
+					},
+				},
+			},
+			"my-pvc",
+			true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := podMountsPVC(tt.pod, tt.pvcName)
+			if got != tt.want {
+				t.Errorf("podMountsPVC() = %v, want %v", got, tt.want)
 			}
 		})
 	}

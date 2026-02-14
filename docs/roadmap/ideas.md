@@ -1,12 +1,8 @@
 ## Future Improvements
 
 ### Tier 1: Quick Wins
-#### 1.1 Node Filtering - Query Only Nodes with Target PVCs
-Current: Query ALL nodes for kubelet stats.
-
-Proposed: Build node set from mounted PVCs, query only those nodes.
-
-Benefit: Could reduce queries, and thus load on API server.
+#### 1.1 Node Filtering - Query Only Nodes with Target PVCs ✓
+Implemented: Controller now discovers target PVCs first, finds pods mounting them, extracts node names, and only queries those specific nodes for kubelet stats.
 
 #### 1.2 Concurrent PVC Patching
 Current: Sequential pvc.Update() calls.
