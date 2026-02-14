@@ -53,18 +53,28 @@ func NewStatsClient(clientset kubernetes.Interface) MetricsClient {
 	return &statsClient{clientset: clientset}
 }
 
-func (c *statsClient) GetMetrics(ctx context.Context) (map[types.NamespacedName]*VolumeStats, error) {
-	nodes, err := c.clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return nil, fmt.Errorf("listing nodes: %w", err)
+func (c *statsClient) GetMetrics(ctx context.Context, nodeNames []string) (map[types.NamespacedName]*VolumeStats, error) {
+	var nodesToQuery []string
+
+	if len(nodeNames) > 0 {
+		nodesToQuery = nodeNames
+	} else {
+		nodes, err := c.clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+		if err != nil {
+			return nil, fmt.Errorf("listing nodes: %w", err)
+		}
+		nodesToQuery = make([]string, len(nodes.Items))
+		for i, node := range nodes.Items {
+			nodesToQuery[i] = node.Name
+		}
 	}
 
 	result := make(map[types.NamespacedName]*VolumeStats)
 	var mu sync.Mutex
 
 	eg, ctx := errgroup.WithContext(ctx)
-	for _, node := range nodes.Items {
-		nodeName := node.Name
+	for _, nodeName := range nodesToQuery {
+		nodeName := nodeName
 		eg.Go(func() error {
 			nodeStats, err := c.getNodeStats(ctx, nodeName)
 			if err != nil {

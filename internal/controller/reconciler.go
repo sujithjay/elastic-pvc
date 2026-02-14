@@ -62,7 +62,20 @@ func (a *Autoscaler) reconcile(ctx context.Context) {
 		return
 	}
 
-	vsMap, err := a.metricsClient.GetMetrics(ctx)
+	nodeNames, err := a.getNodesWithTargetPVCs(ctx, scList)
+	if err != nil {
+		a.log.Error(err, "getting nodes with target PVCs")
+		return
+	}
+
+	if len(nodeNames) == 0 {
+		a.log.V(1).Info("no target PVCs found, skipping kubelet queries")
+		return
+	}
+
+	a.log.V(1).Info("querying kubelet stats", "nodeCount", len(nodeNames))
+
+	vsMap, err := a.metricsClient.GetMetrics(ctx, nodeNames)
 	if err != nil {
 		a.log.Error(err, "getting volume metrics")
 		return
@@ -121,6 +134,60 @@ func isTargetPVC(pvc *corev1.PersistentVolumeClaim) bool {
 		return false
 	}
 	return pvc.Status.Phase == corev1.ClaimBound
+}
+
+// getNodesWithTargetPVCs returns the set of node names where target PVCs are mounted.
+func (a *Autoscaler) getNodesWithTargetPVCs(ctx context.Context, scList *storagev1.StorageClassList) ([]string, error) {
+	nodeSet := make(map[string]struct{})
+
+	for _, sc := range scList.Items {
+		var pvcList corev1.PersistentVolumeClaimList
+		if err := a.client.List(ctx, &pvcList, client.MatchingFields{
+			indexStorageClassName: sc.Name,
+		}); err != nil {
+			return nil, fmt.Errorf("listing PVCs for StorageClass %s: %w", sc.Name, err)
+		}
+
+		for i := range pvcList.Items {
+			pvc := &pvcList.Items[i]
+			if !isTargetPVC(pvc) {
+				continue
+			}
+
+			var podList corev1.PodList
+			if err := a.client.List(ctx, &podList,
+				client.InNamespace(pvc.Namespace),
+			); err != nil {
+				return nil, fmt.Errorf("listing pods in namespace %s: %w", pvc.Namespace, err)
+			}
+
+			for j := range podList.Items {
+				pod := &podList.Items[j]
+				if pod.Spec.NodeName == "" {
+					continue
+				}
+				if podMountsPVC(pod, pvc.Name) {
+					nodeSet[pod.Spec.NodeName] = struct{}{}
+				}
+			}
+		}
+	}
+
+	nodes := make([]string, 0, len(nodeSet))
+	for node := range nodeSet {
+		nodes = append(nodes, node)
+	}
+	return nodes, nil
+}
+
+// podMountsPVC returns true if the pod has a volume that references the named PVC.
+func podMountsPVC(pod *corev1.Pod, pvcName string) bool {
+	for _, vol := range pod.Spec.Volumes {
+		if vol.PersistentVolumeClaim != nil && vol.PersistentVolumeClaim.ClaimName == pvcName {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *Autoscaler) resizeIfNeeded(ctx context.Context, pvc *corev1.PersistentVolumeClaim, vs *kubelet.VolumeStats) error {
