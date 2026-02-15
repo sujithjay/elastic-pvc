@@ -1,0 +1,11 @@
+# KIND cluster configuration for elastic-pvc testing
+# Uses CSI Hostpath Driver for volume expansion testing
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: elastic-pvc-test
+nodes:
+  - role: control-plane
+    extraMounts:
+      # Mount for debugging/logs
+      - hostPath: /tmp/elastic-pvc-test
+        containerPath: /var/local-path-provisioner
