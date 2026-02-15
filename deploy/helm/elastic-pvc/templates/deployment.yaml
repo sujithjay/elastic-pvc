@@ -21,6 +21,8 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
             - --interval={{ .Values.controller.interval }}
+            - --max-resizes-per-cycle={{ .Values.controller.maxResizesPerCycle }}
+            - --resize-cooldown={{ .Values.controller.cooldown }}
             - --metrics-addr=:8080
             - --health-addr=:8081
           ports:

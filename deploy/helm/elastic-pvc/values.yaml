@@ -7,6 +7,8 @@ image:
 
 controller:
   interval: 60s
+  maxResizesPerCycle: 10
+  cooldown: "5m"
   logLevel: info  # info or debug
 
 resources:

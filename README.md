@@ -58,14 +58,30 @@ metadata:
 | `elastic-pvc.io/storage-limit` | Yes | - | Maximum size the PVC can grow to (e.g., `500Gi`) |
 | `elastic-pvc.io/threshold` | No | `20%` | Free-space threshold that triggers expansion. Percentage or absolute (e.g., `10Gi`) |
 | `elastic-pvc.io/increase` | No | `50%` | How much to grow each time. Percentage of current capacity or absolute |
+| `elastic-pvc.io/cooldown` | No | `5m` | Minimum interval between resizes for this PVC (e.g., `10m`, `1h`). Overrides global `--resize-cooldown` |
 
 ### Controller Flags
 
 | Flag | Default | Description |
 |---|---|---|
 | `--interval` | `1m` | How often to check PVC usage |
+| `--max-resizes-per-cycle` | `10` | Maximum resize operations per reconciliation cycle |
+| `--resize-cooldown` | `5m` | Minimum interval between resizes for the same PVC |
 | `--metrics-addr` | `:8080` | Prometheus metrics endpoint |
 | `--health-addr` | `:8081` | Health/readiness probe endpoint |
+
+### Rate Limiting
+
+elastic-pvc includes rate limiting to prevent EBS API exhaustion during burst scenarios:
+
+1. **Per-cycle limit**: Only `--max-resizes-per-cycle` PVCs are resized per reconciliation cycle. PVCs with the lowest available space are prioritized.
+
+2. **Per-PVC cooldown**: After a resize, each PVC enters a cooldown period (default: 5 minutes) before it can be resized again. This can be overridden per-PVC with the `elastic-pvc.io/cooldown` annotation.
+
+Rate limiting metrics are exposed at `/metrics`:
+- `elastic_pvc_rate_limited_total{reason="cooldown"}` - resizes skipped due to cooldown
+- `elastic_pvc_rate_limited_total{reason="per_cycle_limit"}` - resizes deferred due to per-cycle limit
+- `elastic_pvc_resizes_total` - successful resize operations
 
 ## Example: Spark on Kubernetes
 

@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strconv"
 	"time"
 
@@ -21,21 +22,34 @@ import (
 
 // Autoscaler periodically checks PVC usage and expands volumes when needed.
 type Autoscaler struct {
-	metricsClient kubelet.MetricsClient
-	client        client.Client
-	recorder      record.EventRecorder
-	interval      time.Duration
-	log           logr.Logger
+	metricsClient      kubelet.MetricsClient
+	client             client.Client
+	recorder           record.EventRecorder
+	interval           time.Duration
+	maxResizesPerCycle int
+	resizeCooldown     time.Duration
+	log                logr.Logger
+}
+
+// resizeCandidate represents a PVC that needs to be resized.
+type resizeCandidate struct {
+	pvc            *corev1.PersistentVolumeClaim
+	stats          *kubelet.VolumeStats
+	newSize        int64
+	currentCapQty  resource.Quantity
+	availableBytes int64
 }
 
 // NewAutoscaler creates an Autoscaler that runs as a controller-runtime Runnable.
-func NewAutoscaler(mc kubelet.MetricsClient, c client.Client, recorder record.EventRecorder, interval time.Duration) *Autoscaler {
+func NewAutoscaler(mc kubelet.MetricsClient, c client.Client, recorder record.EventRecorder, interval time.Duration, maxResizesPerCycle int, resizeCooldown time.Duration) *Autoscaler {
 	return &Autoscaler{
-		metricsClient: mc,
-		client:        c,
-		recorder:      recorder,
-		interval:      interval,
-		log:           ctrl.Log.WithName("autoscaler"),
+		metricsClient:      mc,
+		client:             c,
+		recorder:           recorder,
+		interval:           interval,
+		maxResizesPerCycle: maxResizesPerCycle,
+		resizeCooldown:     resizeCooldown,
+		log:                ctrl.Log.WithName("autoscaler"),
 	}
 }
 
@@ -81,8 +95,43 @@ func (a *Autoscaler) reconcile(ctx context.Context) {
 		return
 	}
 
+	// Collect candidates from all StorageClasses
+	var allCandidates []*resizeCandidate
 	for _, sc := range scList.Items {
-		a.reconcileStorageClass(ctx, &sc, vsMap)
+		candidates := a.collectCandidates(ctx, &sc, vsMap)
+		allCandidates = append(allCandidates, candidates...)
+	}
+
+	if len(allCandidates) == 0 {
+		return
+	}
+
+	// Sort by available bytes ascending (most critical first)
+	sort.Slice(allCandidates, func(i, j int) bool {
+		return allCandidates[i].availableBytes < allCandidates[j].availableBytes
+	})
+
+	// Process up to maxResizesPerCycle candidates
+	resizeCount := 0
+	for _, candidate := range allCandidates {
+		if resizeCount >= a.maxResizesPerCycle {
+			a.log.V(1).Info("per-cycle limit reached, deferring resize",
+				"namespace", candidate.pvc.Namespace,
+				"name", candidate.pvc.Name,
+				"availableBytes", candidate.availableBytes,
+			)
+			rateLimitedTotal.WithLabelValues("per_cycle_limit").Inc()
+			continue
+		}
+
+		if err := a.executeResize(ctx, candidate); err != nil {
+			a.log.Error(err, "resizing PVC",
+				"namespace", candidate.pvc.Namespace,
+				"name", candidate.pvc.Name,
+			)
+			continue
+		}
+		resizeCount++
 	}
 }
 
@@ -97,16 +146,18 @@ func (a *Autoscaler) getEnabledStorageClasses(ctx context.Context) (*storagev1.S
 	return &scList, nil
 }
 
-func (a *Autoscaler) reconcileStorageClass(ctx context.Context, sc *storagev1.StorageClass, vsMap map[types.NamespacedName]*kubelet.VolumeStats) {
+// collectCandidates evaluates all PVCs in the StorageClass and returns resize candidates.
+func (a *Autoscaler) collectCandidates(ctx context.Context, sc *storagev1.StorageClass, vsMap map[types.NamespacedName]*kubelet.VolumeStats) []*resizeCandidate {
 	var pvcList corev1.PersistentVolumeClaimList
 	err := a.client.List(ctx, &pvcList, client.MatchingFields{
 		indexStorageClassName: sc.Name,
 	})
 	if err != nil {
 		a.log.Error(err, "listing PVCs", "storageClass", sc.Name)
-		return
+		return nil
 	}
 
+	var candidates []*resizeCandidate
 	for i := range pvcList.Items {
 		pvc := &pvcList.Items[i]
 		if !isTargetPVC(pvc) {
@@ -119,10 +170,146 @@ func (a *Autoscaler) reconcileStorageClass(ctx context.Context, sc *storagev1.St
 			continue // volume not mounted by any pod
 		}
 
-		if err := a.resizeIfNeeded(ctx, pvc, vs); err != nil {
-			a.log.Error(err, "resizing PVC", "namespace", pvc.Namespace, "name", pvc.Name)
+		candidate := a.evaluateCandidate(pvc, vs)
+		if candidate != nil {
+			candidates = append(candidates, candidate)
 		}
 	}
+
+	return candidates
+}
+
+// evaluateCandidate checks if a PVC needs resizing and returns a candidate, or nil if not.
+func (a *Autoscaler) evaluateCandidate(pvc *corev1.PersistentVolumeClaim, vs *kubelet.VolumeStats) *resizeCandidate {
+	log := a.log.WithValues("namespace", pvc.Namespace, "name", pvc.Name)
+
+	// Check cooldown first (cheap check)
+	if a.isInCooldown(pvc) {
+		log.V(1).Info("skipping: in cooldown period")
+		rateLimitedTotal.WithLabelValues("cooldown").Inc()
+		return nil
+	}
+
+	limitQty, err := resource.ParseQuantity(pvc.Annotations[elasticpvc.StorageLimitAnnotation])
+	if err != nil {
+		log.Error(err, "parsing storage-limit")
+		return nil
+	}
+	limitBytes := limitQty.Value()
+
+	currentCap, ok := pvc.Status.Capacity[corev1.ResourceStorage]
+	if !ok || currentCap.Value() == 0 {
+		log.V(1).Info("skipping: capacity not set yet")
+		return nil
+	}
+
+	if currentCap.Value() >= limitBytes {
+		log.V(1).Info("skipping: storage limit reached")
+		return nil
+	}
+
+	// Detect in-progress resize
+	if prevCap, ok := pvc.Annotations[elasticpvc.PrevCapacityAnnotation]; ok {
+		if prevCapBytes, err := strconv.ParseInt(prevCap, 10, 64); err == nil {
+			if prevCapBytes == vs.CapacityBytes {
+				log.V(1).Info("skipping: resize in progress")
+				return nil
+			}
+		}
+	}
+
+	// Parse threshold
+	thresholdStr := annotationOrDefault(pvc, elasticpvc.ThresholdAnnotation, elasticpvc.DefaultThreshold)
+	thresholdBytes, err := resize.ParseValue(thresholdStr, vs.CapacityBytes)
+	if err != nil {
+		log.Error(err, "parsing threshold", "threshold", thresholdStr)
+		return nil
+	}
+
+	if vs.AvailableBytes >= thresholdBytes {
+		return nil // enough free space
+	}
+
+	// Parse increase
+	increaseStr := annotationOrDefault(pvc, elasticpvc.IncreaseAnnotation, elasticpvc.DefaultIncrease)
+	increaseBytes, err := resize.ParseValue(increaseStr, currentCap.Value())
+	if err != nil {
+		log.Error(err, "parsing increase", "increase", increaseStr)
+		return nil
+	}
+
+	newSizeBytes := resize.CalculateNewSize(currentCap.Value(), increaseBytes, limitBytes)
+
+	return &resizeCandidate{
+		pvc:            pvc,
+		stats:          vs,
+		newSize:        newSizeBytes,
+		currentCapQty:  currentCap,
+		availableBytes: vs.AvailableBytes,
+	}
+}
+
+// executeResize performs the actual PVC resize operation.
+func (a *Autoscaler) executeResize(ctx context.Context, candidate *resizeCandidate) error {
+	pvc := candidate.pvc
+	newSize := resource.NewQuantity(candidate.newSize, resource.BinarySI)
+
+	// Patch the PVC
+	if pvc.Annotations == nil {
+		pvc.Annotations = make(map[string]string)
+	}
+	pvc.Annotations[elasticpvc.PrevCapacityAnnotation] = strconv.FormatInt(candidate.stats.CapacityBytes, 10)
+	pvc.Annotations[elasticpvc.LastResizeAnnotation] = time.Now().UTC().Format(time.RFC3339)
+	pvc.Spec.Resources.Requests[corev1.ResourceStorage] = *newSize
+
+	if err := a.client.Update(ctx, pvc); err != nil {
+		return fmt.Errorf("updating PVC: %w", err)
+	}
+
+	a.log.Info("resize triggered",
+		"namespace", pvc.Namespace,
+		"name", pvc.Name,
+		"from", candidate.currentCapQty.String(),
+		"to", newSize.String(),
+		"available", candidate.stats.AvailableBytes,
+	)
+	a.recorder.Eventf(pvc, corev1.EventTypeNormal, "Resized",
+		"PVC resized from %s to %s", candidate.currentCapQty.String(), newSize.String())
+	resizesTotal.Inc()
+
+	return nil
+}
+
+// getCooldown returns the effective cooldown for a PVC, checking the annotation override first.
+func (a *Autoscaler) getCooldown(pvc *corev1.PersistentVolumeClaim) time.Duration {
+	if override, ok := pvc.Annotations[elasticpvc.CooldownAnnotation]; ok {
+		if d, err := time.ParseDuration(override); err == nil {
+			return d
+		}
+		// If parsing fails, fall through to default
+		a.log.V(1).Info("invalid cooldown annotation, using default",
+			"namespace", pvc.Namespace,
+			"name", pvc.Name,
+			"value", override,
+		)
+	}
+	return a.resizeCooldown
+}
+
+// isInCooldown returns true if the PVC was resized too recently.
+func (a *Autoscaler) isInCooldown(pvc *corev1.PersistentVolumeClaim) bool {
+	lastResize, ok := pvc.Annotations[elasticpvc.LastResizeAnnotation]
+	if !ok {
+		return false
+	}
+
+	lastResizeTime, err := time.Parse(time.RFC3339, lastResize)
+	if err != nil {
+		return false
+	}
+
+	cooldown := a.getCooldown(pvc)
+	return time.Since(lastResizeTime) < cooldown
 }
 
 // isTargetPVC returns true if the PVC should be managed by elastic-pvc.
@@ -188,80 +375,6 @@ func podMountsPVC(pod *corev1.Pod, pvcName string) bool {
 		}
 	}
 	return false
-}
-
-func (a *Autoscaler) resizeIfNeeded(ctx context.Context, pvc *corev1.PersistentVolumeClaim, vs *kubelet.VolumeStats) error {
-	log := a.log.WithValues("namespace", pvc.Namespace, "name", pvc.Name)
-
-	limitQty, err := resource.ParseQuantity(pvc.Annotations[elasticpvc.StorageLimitAnnotation])
-	if err != nil {
-		return fmt.Errorf("parsing storage-limit: %w", err)
-	}
-	limitBytes := limitQty.Value()
-
-	currentCap, ok := pvc.Status.Capacity[corev1.ResourceStorage]
-	if !ok || currentCap.Value() == 0 {
-		log.V(1).Info("skipping: capacity not set yet")
-		return nil
-	}
-
-	if currentCap.Value() >= limitBytes {
-		log.V(1).Info("skipping: storage limit reached")
-		return nil
-	}
-
-	// Detect in-progress resize
-	if prevCap, ok := pvc.Annotations[elasticpvc.PrevCapacityAnnotation]; ok {
-		if prevCapBytes, err := strconv.ParseInt(prevCap, 10, 64); err == nil {
-			if prevCapBytes == vs.CapacityBytes {
-				log.V(1).Info("skipping: resize in progress")
-				return nil
-			}
-		}
-	}
-
-	// Parse threshold
-	thresholdStr := annotationOrDefault(pvc, elasticpvc.ThresholdAnnotation, elasticpvc.DefaultThreshold)
-	thresholdBytes, err := resize.ParseValue(thresholdStr, vs.CapacityBytes)
-	if err != nil {
-		return fmt.Errorf("parsing threshold %q: %w", thresholdStr, err)
-	}
-
-	if vs.AvailableBytes >= thresholdBytes {
-		return nil // enough free space
-	}
-
-	// Parse increase
-	increaseStr := annotationOrDefault(pvc, elasticpvc.IncreaseAnnotation, elasticpvc.DefaultIncrease)
-	increaseBytes, err := resize.ParseValue(increaseStr, currentCap.Value())
-	if err != nil {
-		return fmt.Errorf("parsing increase %q: %w", increaseStr, err)
-	}
-
-	newSizeBytes := resize.CalculateNewSize(currentCap.Value(), increaseBytes, limitBytes)
-	newSize := resource.NewQuantity(newSizeBytes, resource.BinarySI)
-
-	// Patch the PVC
-	if pvc.Annotations == nil {
-		pvc.Annotations = make(map[string]string)
-	}
-	pvc.Annotations[elasticpvc.PrevCapacityAnnotation] = strconv.FormatInt(vs.CapacityBytes, 10)
-	pvc.Spec.Resources.Requests[corev1.ResourceStorage] = *newSize
-
-	if err := a.client.Update(ctx, pvc); err != nil {
-		return fmt.Errorf("updating PVC: %w", err)
-	}
-
-	log.Info("resize triggered",
-		"from", currentCap.String(),
-		"to", newSize.String(),
-		"available", vs.AvailableBytes,
-		"threshold", thresholdBytes,
-	)
-	a.recorder.Eventf(pvc, corev1.EventTypeNormal, "Resized",
-		"PVC resized from %s to %s", currentCap.String(), newSize.String())
-
-	return nil
 }
 
 func annotationOrDefault(pvc *corev1.PersistentVolumeClaim, key, defaultVal string) string {
