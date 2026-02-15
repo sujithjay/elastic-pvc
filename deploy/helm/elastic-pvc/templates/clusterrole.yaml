@@ -18,5 +18,8 @@ rules:
     resources: ["nodes/proxy"]
     verbs: ["get"]
   - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
     resources: ["events"]
     verbs: ["create", "patch"]
