@@ -84,4 +84,6 @@ The controller needs:
 | `elastic-pvc.io/storage-limit` | PVC | Max size (required to be managed) |
 | `elastic-pvc.io/threshold` | PVC | Free-space trigger (default: 20%) |
 | `elastic-pvc.io/increase` | PVC | Growth amount (default: 50%) |
+| `elastic-pvc.io/cooldown` | PVC | Override per-PVC cooldown (e.g., "10m") |
 | `elastic-pvc.io/prev-capacity` | PVC | Internal: tracks in-progress resize |
+| `elastic-pvc.io/last-resize` | PVC | Internal: RFC3339 timestamp of last resize |

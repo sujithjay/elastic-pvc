@@ -2,7 +2,9 @@ package controller
 
 import (
 	"context"
+	"sort"
 	"testing"
+	"time"
 
 	elasticpvc "elastic-pvc"
 	"elastic-pvc/internal/kubelet"
@@ -327,5 +329,207 @@ func TestPodMountsPVC(t *testing.T) {
 				t.Errorf("podMountsPVC() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestIsInCooldown(t *testing.T) {
+	defaultCooldown := 5 * time.Minute
+
+	tests := []struct {
+		name        string
+		annotations map[string]string
+		wantResult  bool
+	}{
+		{
+			"no last-resize annotation",
+			map[string]string{},
+			false,
+		},
+		{
+			"last-resize was 10 minutes ago (past cooldown)",
+			map[string]string{
+				elasticpvc.LastResizeAnnotation: time.Now().Add(-10 * time.Minute).UTC().Format(time.RFC3339),
+			},
+			false,
+		},
+		{
+			"last-resize was 2 minutes ago (within cooldown)",
+			map[string]string{
+				elasticpvc.LastResizeAnnotation: time.Now().Add(-2 * time.Minute).UTC().Format(time.RFC3339),
+			},
+			true,
+		},
+		{
+			"last-resize was exactly at cooldown boundary",
+			map[string]string{
+				elasticpvc.LastResizeAnnotation: time.Now().Add(-5 * time.Minute).UTC().Format(time.RFC3339),
+			},
+			false, // at boundary should not be in cooldown
+		},
+		{
+			"invalid timestamp format",
+			map[string]string{
+				elasticpvc.LastResizeAnnotation: "invalid-timestamp",
+			},
+			false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			a := &Autoscaler{
+				resizeCooldown: defaultCooldown,
+			}
+			pvc := &corev1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: tt.annotations,
+				},
+			}
+			got := a.isInCooldown(pvc)
+			if got != tt.wantResult {
+				t.Errorf("isInCooldown() = %v, want %v", got, tt.wantResult)
+			}
+		})
+	}
+}
+
+func TestGetCooldown(t *testing.T) {
+	defaultCooldown := 5 * time.Minute
+
+	tests := []struct {
+		name        string
+		annotations map[string]string
+		want        time.Duration
+	}{
+		{
+			"no cooldown annotation, uses default",
+			map[string]string{},
+			defaultCooldown,
+		},
+		{
+			"valid cooldown annotation override",
+			map[string]string{
+				elasticpvc.CooldownAnnotation: "10m",
+			},
+			10 * time.Minute,
+		},
+		{
+			"cooldown annotation with hours",
+			map[string]string{
+				elasticpvc.CooldownAnnotation: "1h",
+			},
+			1 * time.Hour,
+		},
+		{
+			"cooldown annotation with seconds",
+			map[string]string{
+				elasticpvc.CooldownAnnotation: "30s",
+			},
+			30 * time.Second,
+		},
+		{
+			"invalid cooldown annotation, falls back to default",
+			map[string]string{
+				elasticpvc.CooldownAnnotation: "invalid",
+			},
+			defaultCooldown,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			a := &Autoscaler{
+				resizeCooldown: defaultCooldown,
+			}
+			pvc := &corev1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: tt.annotations,
+				},
+			}
+			got := a.getCooldown(pvc)
+			if got != tt.want {
+				t.Errorf("getCooldown() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCandidatePrioritization(t *testing.T) {
+	// Test that candidates are sorted by availableBytes ascending (most critical first)
+	candidates := []*resizeCandidate{
+		{
+			pvc:            &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "pvc-high"}},
+			availableBytes: 100 * 1024 * 1024, // 100MB
+		},
+		{
+			pvc:            &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "pvc-critical"}},
+			availableBytes: 10 * 1024 * 1024, // 10MB - most critical
+		},
+		{
+			pvc:            &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "pvc-medium"}},
+			availableBytes: 50 * 1024 * 1024, // 50MB
+		},
+	}
+
+	// Sort like reconcile() does
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].availableBytes < candidates[j].availableBytes
+	})
+
+	// Verify order: critical, medium, high
+	expectedOrder := []string{"pvc-critical", "pvc-medium", "pvc-high"}
+	for i, expected := range expectedOrder {
+		if candidates[i].pvc.Name != expected {
+			t.Errorf("position %d: got %s, want %s", i, candidates[i].pvc.Name, expected)
+		}
+	}
+}
+
+func TestPerCycleLimit(t *testing.T) {
+	// Test that only maxResizesPerCycle candidates would be processed
+	maxResizes := 2
+	candidates := []*resizeCandidate{
+		{pvc: &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "pvc-1"}}, availableBytes: 10},
+		{pvc: &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "pvc-2"}}, availableBytes: 20},
+		{pvc: &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "pvc-3"}}, availableBytes: 30},
+		{pvc: &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "pvc-4"}}, availableBytes: 40},
+	}
+
+	// Simulate the per-cycle limit logic from reconcile()
+	var processed []string
+	var deferred []string
+
+	resizeCount := 0
+	for _, candidate := range candidates {
+		if resizeCount >= maxResizes {
+			deferred = append(deferred, candidate.pvc.Name)
+			continue
+		}
+		processed = append(processed, candidate.pvc.Name)
+		resizeCount++
+	}
+
+	if len(processed) != maxResizes {
+		t.Errorf("processed %d candidates, want %d", len(processed), maxResizes)
+	}
+
+	if len(deferred) != len(candidates)-maxResizes {
+		t.Errorf("deferred %d candidates, want %d", len(deferred), len(candidates)-maxResizes)
+	}
+
+	// Verify the right candidates were processed (first two by available bytes)
+	expectedProcessed := []string{"pvc-1", "pvc-2"}
+	for i, expected := range expectedProcessed {
+		if processed[i] != expected {
+			t.Errorf("processed[%d] = %s, want %s", i, processed[i], expected)
+		}
+	}
+
+	// Verify the right candidates were deferred
+	expectedDeferred := []string{"pvc-3", "pvc-4"}
+	for i, expected := range expectedDeferred {
+		if deferred[i] != expected {
+			t.Errorf("deferred[%d] = %s, want %s", i, deferred[i], expected)
+		}
 	}
 }

@@ -17,10 +17,12 @@ import (
 )
 
 var cfg struct {
-	metricsAddr   string
-	healthAddr    string
-	watchInterval time.Duration
-	development   bool
+	metricsAddr        string
+	healthAddr         string
+	watchInterval      time.Duration
+	maxResizesPerCycle int
+	resizeCooldown     time.Duration
+	development        bool
 }
 
 var rootCmd = &cobra.Command{
@@ -46,6 +48,8 @@ func init() {
 	fs.StringVar(&cfg.metricsAddr, "metrics-addr", ":8080", "Address for the metrics endpoint")
 	fs.StringVar(&cfg.healthAddr, "health-addr", ":8081", "Address for health/readiness probes")
 	fs.DurationVar(&cfg.watchInterval, "interval", 1*time.Minute, "Interval between resize checks")
+	fs.IntVar(&cfg.maxResizesPerCycle, "max-resizes-per-cycle", 10, "Maximum number of resize operations per reconciliation cycle")
+	fs.DurationVar(&cfg.resizeCooldown, "resize-cooldown", 5*time.Minute, "Minimum interval between resizes for the same PVC")
 	fs.BoolVar(&cfg.development, "development", false, "Enable development logging")
 }
 
@@ -80,6 +84,8 @@ func run() error {
 		mgr.GetClient(),
 		mgr.GetEventRecorderFor("elastic-pvc"),
 		cfg.watchInterval,
+		cfg.maxResizesPerCycle,
+		cfg.resizeCooldown,
 	)
 	if err := mgr.Add(autoscaler); err != nil {
 		return fmt.Errorf("adding autoscaler: %w", err)
