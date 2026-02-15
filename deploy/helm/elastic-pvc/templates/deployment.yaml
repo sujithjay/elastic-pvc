@@ -25,6 +25,9 @@ spec:
             - --resize-cooldown={{ .Values.controller.cooldown }}
             - --metrics-addr=:8080
             - --health-addr=:8081
+            {{- if eq .Values.controller.logLevel "debug" }}
+            - --development
+            {{- end }}
           ports:
             - name: metrics
               containerPort: 8080
