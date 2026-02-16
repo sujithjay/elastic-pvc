@@ -129,11 +129,19 @@ func TestAnnotationOrDefault(t *testing.T) {
 
 // fakeMetricsClient implements kubelet.MetricsClient for testing.
 type fakeMetricsClient struct {
-	stats map[types.NamespacedName]*kubelet.VolumeStats
+	stats       map[types.NamespacedName]*kubelet.VolumeStats
+	failedNodes []kubelet.NodeError
+	err         error
 }
 
-func (f *fakeMetricsClient) GetMetrics(_ context.Context, _ []string) (map[types.NamespacedName]*kubelet.VolumeStats, error) {
-	return f.stats, nil
+func (f *fakeMetricsClient) GetMetrics(_ context.Context, _ []string) (*kubelet.MetricsResult, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	return &kubelet.MetricsResult{
+		Stats:       f.stats,
+		FailedNodes: f.failedNodes,
+	}, nil
 }
 
 func TestResizeDecision(t *testing.T) {

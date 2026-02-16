@@ -89,11 +89,22 @@ func (a *Autoscaler) reconcile(ctx context.Context) {
 
 	a.log.V(1).Info("querying kubelet stats", "nodeCount", len(nodeNames))
 
-	vsMap, err := a.metricsClient.GetMetrics(ctx, nodeNames)
+	metricsResult, err := a.metricsClient.GetMetrics(ctx, nodeNames)
 	if err != nil {
 		a.log.Error(err, "getting volume metrics")
 		return
 	}
+
+	if metricsResult.HasFailures() {
+		for _, nodeErr := range metricsResult.FailedNodes {
+			a.log.Info("failed to query node kubelet stats",
+				"node", nodeErr.NodeName,
+				"error", nodeErr.Err.Error())
+		}
+		nodeQueryFailuresTotal.Add(float64(len(metricsResult.FailedNodes)))
+	}
+
+	vsMap := metricsResult.Stats
 
 	// Collect candidates from all StorageClasses
 	var allCandidates []*resizeCandidate

@@ -22,9 +22,18 @@ var (
 			Help: "Total successful PVC resize operations",
 		},
 	)
+
+	// nodeQueryFailuresTotal counts kubelet stats query failures.
+	nodeQueryFailuresTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "elastic_pvc_node_query_failures_total",
+			Help: "Total kubelet stats query failures",
+		},
+	)
 )
 
 func init() {
 	metrics.Registry.MustRegister(rateLimitedTotal)
 	metrics.Registry.MustRegister(resizesTotal)
+	metrics.Registry.MustRegister(nodeQueryFailuresTotal)
 }
