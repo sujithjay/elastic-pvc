@@ -1,0 +1,47 @@
+# Test environment for elastic-pvc KIND testing
+# Contains all tools needed to run KIND cluster tests
+#
+# Usage: Built and run via run-test.sh
+
+FROM docker:24-cli
+
+# Install base dependencies
+RUN apk add --no-cache \
+    bash \
+    curl \
+    jq \
+    git \
+    go \
+    openssl
+
+# Install kubectl (detect architecture)
+RUN KUBECTL_VERSION=$(curl -sL https://dl.k8s.io/release/stable.txt) && \
+    ARCH=$(uname -m) && \
+    case $ARCH in \
+        x86_64) ARCH=amd64 ;; \
+        aarch64) ARCH=arm64 ;; \
+    esac && \
+    curl -LO "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${ARCH}/kubectl" && \
+    chmod +x kubectl && \
+    mv kubectl /usr/local/bin/
+
+# Install kind (detect architecture)
+ARG KIND_VERSION=v0.20.0
+RUN ARCH=$(uname -m) && \
+    case $ARCH in \
+        x86_64) ARCH=amd64 ;; \
+        aarch64) ARCH=arm64 ;; \
+    esac && \
+    curl -Lo /usr/local/bin/kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-${ARCH}" && \
+    chmod +x /usr/local/bin/kind
+
+# Install helm
+RUN curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+WORKDIR /workspace
+
+# Copy entrypoint script
+COPY hack/kind/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]
