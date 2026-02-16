@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"sync"
 
-	"golang.org/x/sync/errgroup"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
@@ -53,7 +52,7 @@ func NewStatsClient(clientset kubernetes.Interface) MetricsClient {
 	return &statsClient{clientset: clientset}
 }
 
-func (c *statsClient) GetMetrics(ctx context.Context, nodeNames []string) (map[types.NamespacedName]*VolumeStats, error) {
+func (c *statsClient) GetMetrics(ctx context.Context, nodeNames []string) (*MetricsResult, error) {
 	var nodesToQuery []string
 
 	if len(nodeNames) > 0 {
@@ -69,29 +68,34 @@ func (c *statsClient) GetMetrics(ctx context.Context, nodeNames []string) (map[t
 		}
 	}
 
-	result := make(map[types.NamespacedName]*VolumeStats)
+	result := &MetricsResult{
+		Stats: make(map[types.NamespacedName]*VolumeStats),
+	}
 	var mu sync.Mutex
+	var wg sync.WaitGroup
 
-	eg, ctx := errgroup.WithContext(ctx)
 	for _, nodeName := range nodesToQuery {
 		nodeName := nodeName
-		eg.Go(func() error {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
 			nodeStats, err := c.getNodeStats(ctx, nodeName)
-			if err != nil {
-				return fmt.Errorf("node %s: %w", nodeName, err)
-			}
 			mu.Lock()
 			defer mu.Unlock()
-			for k, v := range nodeStats {
-				result[k] = v
+			if err != nil {
+				result.FailedNodes = append(result.FailedNodes, NodeError{
+					NodeName: nodeName,
+					Err:      err,
+				})
+				return
 			}
-			return nil
-		})
+			for k, v := range nodeStats {
+				result.Stats[k] = v
+			}
+		}()
 	}
 
-	if err := eg.Wait(); err != nil {
-		return nil, err
-	}
+	wg.Wait()
 	return result, nil
 }
 
