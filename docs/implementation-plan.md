@@ -31,7 +31,7 @@ Controller (Deployment, 1 replica)
 
 ## Key Design Decisions
 
-1. **Kubelet /stats/summary over /metrics** -- simpler parsing, no Prometheus client dependency. This might NOT be suitable for large clusters because of the additional load on the API server. Future development will improve on this.
+1. **Kubelet /stats/summary over /metrics** -- simpler JSON parsing. This might NOT be suitable for large clusters because of the additional load on the API server. Future development may add support for scraping kubelet /metrics endpoint as an alternative.
 
 2. **Ticker-based loop over watch/reconcile** -- we need to periodically poll kubelet stats which are not Kubernetes events. A simple ticker in a `manager.Runnable` integrates cleanly with controller-runtime.
 
