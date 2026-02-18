@@ -96,6 +96,20 @@ spark.local.dir=/tmp/spark
 
 Each executor gets a fresh EBS-backed PVC. elastic-pvc watches them and grows as Spark spills data to disk. When the executor terminates, `reclaimPolicy: Delete` cleans up the EBS volume.
 
+## Limitations
+
+### EBS Volume Modification Cooldown
+
+AWS allows [up to four Elastic Volume modifications per volume in a rolling 24-hour window](https://aws.amazon.com/about-aws/whats-new/2026/01/amazon-ebs-up-to-four-volume-modifications/). Once a volume hits this limit, further resize attempts will fail until the window rolls over. The `--resize-cooldown` flag (and its per-PVC override `elastic-pvc.io/cooldown`) helps mitigate this by spacing out resize operations on the same volume, reducing the chance of exhausting the four-modification quota. However, if the threshold and increase values are set too aggressively, a single PVC can still hit the AWS limit within 24 hours.
+
+### ModifyVolume API Rate Limits
+
+The EC2 `ModifyVolume` API is subject to standard AWS API rate limits. In clusters with many PVCs resizing concurrently, API throttling can cause resize requests to fail or be delayed. The `--max-resizes-per-cycle` flag bounds concurrent modifications per reconciliation cycle, but operators should monitor for throttling errors in clusters with hundreds of managed PVCs.
+
+### Cost Implications
+
+Automatic storage expansion means EBS costs can grow without manual approval. In large clusters with many short-lived PVCs (e.g., Spark executors), rapid expansion across hundreds of volumes can lead to significant cost increases. The `elastic-pvc.io/storage-limit` annotation caps the maximum size each PVC can reach, providing an upper bound on per-volume cost. Set this annotation thoughtfully — it is the primary safeguard against unbounded storage growth.
+
 ## Development
 
 ```bash
