@@ -110,6 +110,20 @@ The EC2 `ModifyVolume` API is subject to standard AWS API rate limits. In cluste
 
 Automatic storage expansion means EBS costs can grow without manual approval. In large clusters with many short-lived PVCs (e.g., Spark executors), rapid expansion across hundreds of volumes can lead to significant cost increases. The `elastic-pvc.io/storage-limit` annotation caps the maximum size each PVC can reach, providing an upper bound on per-volume cost. Set this annotation thoughtfully — it is the primary safeguard against unbounded storage growth.
 
+## Alternatives
+
+elastic-pvc is not the only way to handle storage for spill-heavy workloads. Depending on your instance types and workload patterns, these alternatives may be a better fit.
+
+### NVMe Instance Store
+
+For clusters already using storage-optimized instances (r6id, c6id, i3, etc.), local NVMe volumes offer significantly higher I/O throughput than EBS. Karpenter's `instanceStorePolicy: RAID0` makes setup straightforward. The trade-off is fixed capacity — if spill size is unpredictable, NVMe alone may not be enough. A hybrid approach combining NVMe with elastic-pvc is also possible.
+
+See [NVMe Instance Store Alternative](docs/alternatives/nvme-instance-store.md) for setup details and trade-offs.
+
+### Dynamic EBS Root Volume Sizing
+
+A [Karpenter blueprint for dynamic EBS volume sizing](https://github.com/aws-samples/karpenter-blueprints/pull/34) uses a DaemonSet to detect instance type and resize root EBS volumes accordingly. This approach sizes volumes at node launch rather than reacting to usage at runtime. It is useful when different instance types need different root volume sizes, but does not handle PVC-level expansion for per-pod storage.
+
 ## Development
 
 ```bash
