@@ -2,7 +2,7 @@
 
 elastic-pvc is a lean Kubernetes controller that expands PersistentVolumeClaims when filesystem usage crosses a threshold.
 
-The target use-case of this project is to handle large disk spills on Spark-on-EKS deployments .
+The target use-case of this project is to handle large disk spills on Spark-on-EKS deployments.
 
 ## How It Works
 
