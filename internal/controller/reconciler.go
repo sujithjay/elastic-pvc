@@ -335,9 +335,11 @@ func isTargetPVC(pvc *corev1.PersistentVolumeClaim) bool {
 }
 
 // getNodesWithTargetPVCs returns the set of node names where target PVCs are mounted.
+// It groups target PVCs by namespace, then lists pods once per namespace to find
+// which nodes mount them — avoiding O(PVCs × Pods) API calls.
 func (a *Autoscaler) getNodesWithTargetPVCs(ctx context.Context, scList *storagev1.StorageClassList) ([]string, error) {
-	nodeSet := make(map[string]struct{})
-
+	// Phase 1: collect target PVC names grouped by namespace.
+	nsPVCs := make(map[string]map[string]struct{})
 	for _, sc := range scList.Items {
 		var pvcList corev1.PersistentVolumeClaimList
 		if err := a.client.List(ctx, &pvcList, client.MatchingFields{
@@ -351,23 +353,22 @@ func (a *Autoscaler) getNodesWithTargetPVCs(ctx context.Context, scList *storage
 			if !isTargetPVC(pvc) {
 				continue
 			}
-
-			var podList corev1.PodList
-			if err := a.client.List(ctx, &podList,
-				client.InNamespace(pvc.Namespace),
-			); err != nil {
-				return nil, fmt.Errorf("listing pods in namespace %s: %w", pvc.Namespace, err)
+			if nsPVCs[pvc.Namespace] == nil {
+				nsPVCs[pvc.Namespace] = make(map[string]struct{})
 			}
+			nsPVCs[pvc.Namespace][pvc.Name] = struct{}{}
+		}
+	}
 
-			for j := range podList.Items {
-				pod := &podList.Items[j]
-				if pod.Spec.NodeName == "" {
-					continue
-				}
-				if podMountsPVC(pod, pvc.Name) {
-					nodeSet[pod.Spec.NodeName] = struct{}{}
-				}
-			}
+	// Phase 2: for each namespace, list pods once and find mounting nodes.
+	nodeSet := make(map[string]struct{})
+	for ns, targetPVCs := range nsPVCs {
+		var podList corev1.PodList
+		if err := a.client.List(ctx, &podList, client.InNamespace(ns)); err != nil {
+			return nil, fmt.Errorf("listing pods in namespace %s: %w", ns, err)
+		}
+		for node := range nodesForPods(podList.Items, targetPVCs) {
+			nodeSet[node] = struct{}{}
 		}
 	}
 
@@ -378,14 +379,25 @@ func (a *Autoscaler) getNodesWithTargetPVCs(ctx context.Context, scList *storage
 	return nodes, nil
 }
 
-// podMountsPVC returns true if the pod has a volume that references the named PVC.
-func podMountsPVC(pod *corev1.Pod, pvcName string) bool {
-	for _, vol := range pod.Spec.Volumes {
-		if vol.PersistentVolumeClaim != nil && vol.PersistentVolumeClaim.ClaimName == pvcName {
-			return true
+// nodesForPods returns the set of node names for pods that mount any of the target PVCs.
+// Pods without a NodeName (unscheduled) are skipped.
+func nodesForPods(pods []corev1.Pod, targetPVCs map[string]struct{}) map[string]struct{} {
+	nodes := make(map[string]struct{})
+	for i := range pods {
+		pod := &pods[i]
+		if pod.Spec.NodeName == "" {
+			continue
+		}
+		for _, vol := range pod.Spec.Volumes {
+			if vol.PersistentVolumeClaim != nil {
+				if _, ok := targetPVCs[vol.PersistentVolumeClaim.ClaimName]; ok {
+					nodes[pod.Spec.NodeName] = struct{}{}
+					break
+				}
+			}
 		}
 	}
-	return false
+	return nodes
 }
 
 func annotationOrDefault(pvc *corev1.PersistentVolumeClaim, key, defaultVal string) string {

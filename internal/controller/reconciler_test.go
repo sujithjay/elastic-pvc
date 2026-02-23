@@ -227,114 +227,136 @@ func TestResizeDecision(t *testing.T) {
 	}
 }
 
-func TestPodMountsPVC(t *testing.T) {
+func TestNodesForPods(t *testing.T) {
 	tests := []struct {
-		name    string
-		pod     *corev1.Pod
-		pvcName string
-		want    bool
+		name       string
+		pods       []corev1.Pod
+		targetPVCs map[string]struct{}
+		wantNodes  map[string]struct{}
 	}{
 		{
-			"pod mounts the PVC",
-			&corev1.Pod{
-				Spec: corev1.PodSpec{
-					Volumes: []corev1.Volume{
-						{
-							Name: "data",
-							VolumeSource: corev1.VolumeSource{
-								PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-									ClaimName: "my-pvc",
-								},
-							},
+			"pods mounting target PVCs return their nodes",
+			[]corev1.Pod{
+				{Spec: corev1.PodSpec{
+					NodeName: "node-1",
+					Volumes: []corev1.Volume{{
+						Name: "data",
+						VolumeSource: corev1.VolumeSource{
+							PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "pvc-a"},
 						},
-					},
-				},
+					}},
+				}},
 			},
-			"my-pvc",
-			true,
+			map[string]struct{}{"pvc-a": {}},
+			map[string]struct{}{"node-1": {}},
 		},
 		{
-			"pod mounts different PVC",
-			&corev1.Pod{
-				Spec: corev1.PodSpec{
-					Volumes: []corev1.Volume{
-						{
-							Name: "data",
-							VolumeSource: corev1.VolumeSource{
-								PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-									ClaimName: "other-pvc",
-								},
-							},
+			"pods mounting non-target PVCs are excluded",
+			[]corev1.Pod{
+				{Spec: corev1.PodSpec{
+					NodeName: "node-1",
+					Volumes: []corev1.Volume{{
+						Name: "data",
+						VolumeSource: corev1.VolumeSource{
+							PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "other-pvc"},
 						},
-					},
-				},
+					}},
+				}},
 			},
-			"my-pvc",
-			false,
+			map[string]struct{}{"pvc-a": {}},
+			map[string]struct{}{},
 		},
 		{
-			"pod has no PVC volumes",
-			&corev1.Pod{
-				Spec: corev1.PodSpec{
+			"unscheduled pods (no NodeName) are skipped",
+			[]corev1.Pod{
+				{Spec: corev1.PodSpec{
+					NodeName: "",
+					Volumes: []corev1.Volume{{
+						Name: "data",
+						VolumeSource: corev1.VolumeSource{
+							PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "pvc-a"},
+						},
+					}},
+				}},
+			},
+			map[string]struct{}{"pvc-a": {}},
+			map[string]struct{}{},
+		},
+		{
+			"multiple pods on same node are deduplicated",
+			[]corev1.Pod{
+				{Spec: corev1.PodSpec{
+					NodeName: "node-1",
+					Volumes: []corev1.Volume{{
+						Name: "data",
+						VolumeSource: corev1.VolumeSource{
+							PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "pvc-a"},
+						},
+					}},
+				}},
+				{Spec: corev1.PodSpec{
+					NodeName: "node-1",
+					Volumes: []corev1.Volume{{
+						Name: "data",
+						VolumeSource: corev1.VolumeSource{
+							PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "pvc-b"},
+						},
+					}},
+				}},
+			},
+			map[string]struct{}{"pvc-a": {}, "pvc-b": {}},
+			map[string]struct{}{"node-1": {}},
+		},
+		{
+			"empty inputs return empty result",
+			nil,
+			map[string]struct{}{},
+			map[string]struct{}{},
+		},
+		{
+			"pod mounting multiple PVCs, one target",
+			[]corev1.Pod{
+				{Spec: corev1.PodSpec{
+					NodeName: "node-2",
 					Volumes: []corev1.Volume{
 						{
 							Name: "config",
 							VolumeSource: corev1.VolumeSource{
 								ConfigMap: &corev1.ConfigMapVolumeSource{
-									LocalObjectReference: corev1.LocalObjectReference{Name: "my-config"},
+									LocalObjectReference: corev1.LocalObjectReference{Name: "cfg"},
 								},
 							},
 						},
-					},
-				},
-			},
-			"my-pvc",
-			false,
-		},
-		{
-			"pod has no volumes",
-			&corev1.Pod{
-				Spec: corev1.PodSpec{
-					Volumes: []corev1.Volume{},
-				},
-			},
-			"my-pvc",
-			false,
-		},
-		{
-			"pod mounts multiple volumes including target PVC",
-			&corev1.Pod{
-				Spec: corev1.PodSpec{
-					Volumes: []corev1.Volume{
 						{
-							Name: "config",
+							Name: "other",
 							VolumeSource: corev1.VolumeSource{
-								ConfigMap: &corev1.ConfigMapVolumeSource{
-									LocalObjectReference: corev1.LocalObjectReference{Name: "my-config"},
-								},
+								PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "non-target"},
 							},
 						},
 						{
 							Name: "data",
 							VolumeSource: corev1.VolumeSource{
-								PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-									ClaimName: "my-pvc",
-								},
+								PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "pvc-a"},
 							},
 						},
 					},
-				},
+				}},
 			},
-			"my-pvc",
-			true,
+			map[string]struct{}{"pvc-a": {}},
+			map[string]struct{}{"node-2": {}},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := podMountsPVC(tt.pod, tt.pvcName)
-			if got != tt.want {
-				t.Errorf("podMountsPVC() = %v, want %v", got, tt.want)
+			got := nodesForPods(tt.pods, tt.targetPVCs)
+			if len(got) != len(tt.wantNodes) {
+				t.Fatalf("nodesForPods() returned %d nodes, want %d", len(got), len(tt.wantNodes))
+			}
+			for node := range tt.wantNodes {
+				if _, ok := got[node]; !ok {
+					t.Errorf("nodesForPods() missing expected node %q", node)
+				}
 			}
 		})
 	}
