@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
+	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -44,12 +45,20 @@ type pvcReference struct {
 // statsClient queries the kubelet /stats/summary endpoint on each node
 // to collect PVC volume usage data.
 type statsClient struct {
-	clientset kubernetes.Interface
+	clientset      kubernetes.Interface
+	maxConcurrent  int
+	nodeTimeout    time.Duration
 }
 
 // NewStatsClient creates a MetricsClient that reads volume stats from kubelet.
-func NewStatsClient(clientset kubernetes.Interface) MetricsClient {
-	return &statsClient{clientset: clientset}
+// maxConcurrent limits the number of parallel kubelet queries.
+// nodeTimeout is the per-node query deadline.
+func NewStatsClient(clientset kubernetes.Interface, maxConcurrent int, nodeTimeout time.Duration) MetricsClient {
+	return &statsClient{
+		clientset:     clientset,
+		maxConcurrent: maxConcurrent,
+		nodeTimeout:   nodeTimeout,
+	}
 }
 
 func (c *statsClient) GetMetrics(ctx context.Context, nodeNames []string) (*MetricsResult, error) {
@@ -74,12 +83,26 @@ func (c *statsClient) GetMetrics(ctx context.Context, nodeNames []string) (*Metr
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 
+	sem := make(chan struct{}, c.maxConcurrent)
+
+dispatch:
 	for _, nodeName := range nodesToQuery {
+		select {
+		case <-ctx.Done():
+			break dispatch
+		case sem <- struct{}{}:
+		}
+
 		nodeName := nodeName
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			nodeStats, err := c.getNodeStats(ctx, nodeName)
+			defer func() { <-sem }()
+
+			nodeCtx, cancel := context.WithTimeout(ctx, c.nodeTimeout)
+			defer cancel()
+
+			nodeStats, err := c.getNodeStats(nodeCtx, nodeName)
 			mu.Lock()
 			defer mu.Unlock()
 			if err != nil {
