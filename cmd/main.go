@@ -17,12 +17,14 @@ import (
 )
 
 var cfg struct {
-	metricsAddr        string
-	healthAddr         string
-	watchInterval      time.Duration
-	maxResizesPerCycle int
-	resizeCooldown     time.Duration
-	development        bool
+	metricsAddr               string
+	healthAddr                string
+	watchInterval             time.Duration
+	maxResizesPerCycle        int
+	resizeCooldown            time.Duration
+	maxConcurrentNodeQueries  int
+	nodeQueryTimeout          time.Duration
+	development               bool
 }
 
 var rootCmd = &cobra.Command{
@@ -50,6 +52,8 @@ func init() {
 	fs.DurationVar(&cfg.watchInterval, "interval", 1*time.Minute, "Interval between resize checks")
 	fs.IntVar(&cfg.maxResizesPerCycle, "max-resizes-per-cycle", 10, "Maximum number of resize operations per reconciliation cycle")
 	fs.DurationVar(&cfg.resizeCooldown, "resize-cooldown", 5*time.Minute, "Minimum interval between resizes for the same PVC")
+	fs.IntVar(&cfg.maxConcurrentNodeQueries, "max-concurrent-node-queries", 10, "Maximum number of parallel kubelet stats requests")
+	fs.DurationVar(&cfg.nodeQueryTimeout, "node-query-timeout", 10*time.Second, "Per-node kubelet stats query timeout")
 	fs.BoolVar(&cfg.development, "development", false, "Enable development logging")
 }
 
@@ -80,7 +84,7 @@ func run() error {
 	}
 
 	autoscaler := controller.NewAutoscaler(
-		kubelet.NewStatsClient(clientset),
+		kubelet.NewStatsClient(clientset, cfg.maxConcurrentNodeQueries, cfg.nodeQueryTimeout),
 		mgr.GetClient(),
 		mgr.GetEventRecorderFor("elastic-pvc"),
 		cfg.watchInterval,

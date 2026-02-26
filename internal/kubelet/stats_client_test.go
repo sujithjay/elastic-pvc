@@ -7,7 +7,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
@@ -180,7 +182,7 @@ func TestGetMetrics_SingleNodeFails(t *testing.T) {
 	server, clientset := setupTestServer(t, nodeResponses)
 	defer server.Close()
 
-	client := NewStatsClient(clientset)
+	client := NewStatsClient(clientset, 10, 30*time.Second)
 	result, err := client.GetMetrics(context.Background(), []string{"node-1", "node-2"})
 
 	if err != nil {
@@ -221,7 +223,7 @@ func TestGetMetrics_AllNodesFail(t *testing.T) {
 	server, clientset := setupTestServer(t, nodeResponses)
 	defer server.Close()
 
-	client := NewStatsClient(clientset)
+	client := NewStatsClient(clientset, 10, 30*time.Second)
 	result, err := client.GetMetrics(context.Background(), []string{"node-1", "node-2", "node-3"})
 
 	if err != nil {
@@ -257,7 +259,7 @@ func TestGetMetrics_MixedFailures(t *testing.T) {
 	server, clientset := setupTestServer(t, nodeResponses)
 	defer server.Close()
 
-	client := NewStatsClient(clientset)
+	client := NewStatsClient(clientset, 10, 30*time.Second)
 	result, err := client.GetMetrics(context.Background(), []string{"node-1", "node-2", "node-3", "node-4"})
 
 	if err != nil {
@@ -310,7 +312,7 @@ func TestGetMetrics_AllNodesSucceed(t *testing.T) {
 	server, clientset := setupTestServer(t, nodeResponses)
 	defer server.Close()
 
-	client := NewStatsClient(clientset)
+	client := NewStatsClient(clientset, 10, 30*time.Second)
 	result, err := client.GetMetrics(context.Background(), []string{"node-1", "node-2"})
 
 	if err != nil {
@@ -329,5 +331,175 @@ func TestGetMetrics_AllNodesSucceed(t *testing.T) {
 
 	if result.HasFailures() {
 		t.Error("HasFailures() should return false")
+	}
+}
+
+// setupDelayServer creates a test server that tracks concurrent in-flight requests
+// and optionally delays responses. handlerDelay is applied per request. The returned
+// atomic int64 tracks the peak concurrent requests observed.
+func setupDelayServer(t *testing.T, nodeNames []string, handlerDelay time.Duration) (*httptest.Server, kubernetes.Interface, *atomic.Int64) {
+	t.Helper()
+
+	var inflight atomic.Int64
+	var peak atomic.Int64
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cur := inflight.Add(1)
+		defer inflight.Add(-1)
+
+		for {
+			old := peak.Load()
+			if cur <= old || peak.CompareAndSwap(old, cur) {
+				break
+			}
+		}
+
+		time.Sleep(handlerDelay)
+
+		parts := strings.Split(r.URL.Path, "/")
+		var nodeName string
+		for i, part := range parts {
+			if part == "nodes" && i+1 < len(parts) {
+				nodeName = parts[i+1]
+				break
+			}
+		}
+
+		resp := makeStatsResponse("pvc-"+nodeName, "default", 5<<30, 10<<30)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(resp))
+	}))
+
+	config := &rest.Config{Host: server.URL}
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		t.Fatalf("creating clientset: %v", err)
+	}
+
+	return server, clientset, &peak
+}
+
+func TestGetMetrics_BoundedConcurrency(t *testing.T) {
+	const maxConcurrent = 3
+	const nodeCount = 20
+
+	nodeNames := make([]string, nodeCount)
+	for i := range nodeNames {
+		nodeNames[i] = fmt.Sprintf("node-%d", i)
+	}
+
+	server, clientset, peak := setupDelayServer(t, nodeNames, 50*time.Millisecond)
+	defer server.Close()
+
+	client := NewStatsClient(clientset, maxConcurrent, 30*time.Second)
+	result, err := client.GetMetrics(context.Background(), nodeNames)
+	if err != nil {
+		t.Fatalf("GetMetrics returned error: %v", err)
+	}
+
+	if len(result.Stats) != nodeCount {
+		t.Errorf("expected %d stats, got %d", nodeCount, len(result.Stats))
+	}
+
+	if peak.Load() > int64(maxConcurrent) {
+		t.Errorf("peak concurrent requests = %d, want <= %d", peak.Load(), maxConcurrent)
+	}
+}
+
+func TestGetMetrics_NodeTimeout(t *testing.T) {
+	fastResp := makeStatsResponse("pvc-fast", "default", 5<<30, 10<<30)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		parts := strings.Split(r.URL.Path, "/")
+		var nodeName string
+		for i, part := range parts {
+			if part == "nodes" && i+1 < len(parts) {
+				nodeName = parts[i+1]
+				break
+			}
+		}
+
+		if nodeName == "slow-node" {
+			// Sleep longer than the node timeout
+			time.Sleep(5 * time.Second)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(fastResp))
+	}))
+	defer server.Close()
+
+	clientset, err := kubernetes.NewForConfig(&rest.Config{Host: server.URL})
+	if err != nil {
+		t.Fatalf("creating clientset: %v", err)
+	}
+
+	nodeTimeout := 200 * time.Millisecond
+	client := NewStatsClient(clientset, 10, nodeTimeout)
+
+	start := time.Now()
+	result, err := client.GetMetrics(context.Background(), []string{"fast-node", "slow-node"})
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("GetMetrics returned error: %v", err)
+	}
+
+	// fast-node should succeed
+	key := types.NamespacedName{Namespace: "default", Name: "pvc-fast"}
+	if _, ok := result.Stats[key]; !ok {
+		t.Error("expected stats for fast-node's pvc-fast")
+	}
+
+	// slow-node should fail with timeout
+	if len(result.FailedNodes) != 1 {
+		t.Fatalf("expected 1 failed node, got %d", len(result.FailedNodes))
+	}
+	if result.FailedNodes[0].NodeName != "slow-node" {
+		t.Errorf("expected slow-node to fail, got %s", result.FailedNodes[0].NodeName)
+	}
+
+	// Total time should be close to nodeTimeout, not 5s
+	if elapsed > 2*time.Second {
+		t.Errorf("GetMetrics took %v, expected close to %v (not slow-node's 5s delay)", elapsed, nodeTimeout)
+	}
+}
+
+func TestGetMetrics_ParentContextCancellation(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// All nodes are slow
+		time.Sleep(10 * time.Second)
+		resp := makeStatsResponse("pvc-x", "default", 5<<30, 10<<30)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(resp))
+	}))
+	defer server.Close()
+
+	clientset, err := kubernetes.NewForConfig(&rest.Config{Host: server.URL})
+	if err != nil {
+		t.Fatalf("creating clientset: %v", err)
+	}
+
+	client := NewStatsClient(clientset, 10, 30*time.Second)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	// Cancel after 200ms
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		cancel()
+	}()
+
+	start := time.Now()
+	_, err = client.GetMetrics(ctx, []string{"node-1", "node-2", "node-3"})
+	elapsed := time.Since(start)
+
+	// Should return promptly (within ~1s, not 30s node timeout or 10s server delay)
+	if elapsed > 2*time.Second {
+		t.Errorf("GetMetrics took %v after context cancellation, expected prompt return", elapsed)
+	}
+
+	// err should be nil (partial results returned), but all nodes should be failed
+	if err != nil {
+		t.Fatalf("GetMetrics returned error: %v", err)
 	}
 }
