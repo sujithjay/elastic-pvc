@@ -64,9 +64,21 @@ func (a *Autoscaler) Start(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
-			a.reconcile(ctx)
+			a.runReconcile(ctx)
 		}
 	}
+}
+
+// runReconcile wraps reconcile with a cycle-level timeout and duration observation.
+// The timeout is 80% of the configured interval to prevent cycles from overlapping.
+func (a *Autoscaler) runReconcile(ctx context.Context) {
+	cycleTimeout := time.Duration(float64(a.interval) * 0.8)
+	cycleCtx, cancel := context.WithTimeout(ctx, cycleTimeout)
+	defer cancel()
+
+	start := time.Now()
+	a.reconcile(cycleCtx)
+	reconcileDurationSeconds.Observe(time.Since(start).Seconds())
 }
 
 func (a *Autoscaler) reconcile(ctx context.Context) {

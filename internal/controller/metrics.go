@@ -30,10 +30,20 @@ var (
 			Help: "Total kubelet stats query failures",
 		},
 	)
+
+	// reconcileDurationSeconds observes how long each reconciliation cycle takes.
+	reconcileDurationSeconds = prometheus.NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "elastic_pvc_reconcile_duration_seconds",
+			Help:    "Duration of each reconciliation cycle in seconds",
+			Buckets: []float64{0.5, 1, 2, 5, 10, 30, 60, 120},
+		},
+	)
 )
 
 func init() {
 	metrics.Registry.MustRegister(rateLimitedTotal)
 	metrics.Registry.MustRegister(resizesTotal)
 	metrics.Registry.MustRegister(nodeQueryFailuresTotal)
+	metrics.Registry.MustRegister(reconcileDurationSeconds)
 }
