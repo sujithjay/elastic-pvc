@@ -96,6 +96,8 @@ spark.local.dir=/tmp/spark
 
 Each executor gets a fresh EBS-backed PVC. elastic-pvc watches them and grows as Spark spills data to disk. When the executor terminates, `reclaimPolicy: Delete` cleans up the EBS volume.
 
+On Spark 4.2.0+, check whether the built-in [`ExecutorPVCResizePlugin`](#spark-420-built-in-pvc-resizing-executorpvcresizeplugin) covers your case before deploying elastic-pvc.
+
 ## Limitations
 
 ### EBS Volume Modification Cooldown
@@ -113,6 +115,39 @@ Automatic storage expansion means EBS costs can grow without manual approval. In
 ## Alternatives
 
 elastic-pvc is not the only way to handle storage for spill-heavy workloads. Depending on your instance types and workload patterns, these alternatives may be a better fit.
+
+### Spark 4.2.0+ Built-in PVC Resizing (`ExecutorPVCResizePlugin`)
+
+Apache Spark 4.2.0 ships a built-in equivalent of elastic-pvc's core loop, added in [SPARK-56693](https://issues.apache.org/jira/browse/SPARK-56693) ([PR #55642](https://github.com/apache/spark/pull/55642)). Note that this lives in Spark's Kubernetes scheduler backend, not in the Spark Operator.
+
+Each executor reports the max filesystem usage ratio across its `spark.local.dir` paths; the driver patches that executor's PVC to `currentSize * (1 + factor)` when the ratio crosses a threshold. Same design point as elastic-pvc: no Prometheus, poll-and-patch, CSI driver performs the resize.
+
+Enable it with:
+
+```properties
+spark.plugins=org.apache.spark.scheduler.cluster.k8s.ExecutorPVCResizePlugin
+spark.kubernetes.executor.pvc.resizeInterval=5min   # default 0min (disabled)
+spark.kubernetes.executor.pvc.resizeThreshold=0.5   # usage ratio that triggers a resize
+spark.kubernetes.executor.pvc.resizeFactor=1.0      # growth factor
+```
+
+**Prefer the built-in plugin when** you are on Spark 4.2.0+, using the `direct` pods allocator ([SPARK-56702](https://issues.apache.org/jira/browse/SPARK-56702)), and you only need spill headroom for executor PVCs. It requires no extra controller, RBAC, or deployment.
+
+**elastic-pvc still applies when** you need one of the following:
+
+| | `ExecutorPVCResizePlugin` | elastic-pvc |
+|---|---|---|
+| Scope | Executor PVCs of one Spark application | Any annotated PVC, cluster-wide |
+| Spark version | 4.2.0+ only | Any |
+| Pods allocator | `direct` only | N/A |
+| Upper size bound | None | `elastic-pvc.io/storage-limit` |
+| Per-PVC cooldown | None (interval only) | `--resize-cooldown` / `elastic-pvc.io/cooldown` |
+| Cluster-wide rate limiting | None | `--max-resizes-per-cycle`, lowest-free-space first |
+| Usage signal | Executor self-report via `DiskBlockManager` | kubelet stats (covers PVCs Spark doesn't know about) |
+
+The absence of a size cap and of EBS-quota-aware rate limiting is the main gap: the plugin can grow volumes without an upper bound and can burn through the [four-modifications-per-24h EBS quota](#ebs-volume-modification-cooldown) on a busy cluster.
+
+Relatedly, [SPARK-55496](https://issues.apache.org/jira/browse/SPARK-55496) (also 4.2.0) relaxes `replacePVCsIfNeeded` so that a PVC expanded by an external autoscaler stays eligible for reuse. On Spark 4.2.0+, elastic-pvc and `spark.kubernetes.driver.reusePersistentVolumeClaim` work correctly together; on earlier versions an expanded PVC is skipped for reuse.
 
 ### NVMe Instance Store
 
